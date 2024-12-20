@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -46,7 +47,9 @@ import (
 	runtimehooksv1 "sigs.k8s.io/cluster-api/exp/runtime/hooks/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/feature"
 	runtimeclient "sigs.k8s.io/cluster-api/internal/runtime/client"
+	runtimeregistry "sigs.k8s.io/cluster-api/internal/runtime/registry"
 	"sigs.k8s.io/cluster-api/internal/topology/variables"
+	"sigs.k8s.io/cluster-api/internal/util/cache"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conversion"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -67,6 +70,10 @@ type Reconciler struct {
 
 	// RuntimeClient is a client for calling runtime extensions.
 	RuntimeClient runtimeclient.Client
+
+	// discoverVariablesCache is used to temporarily store the response of a DiscoveryVariables call for
+	// a specific runtime extension/settings combination.
+	discoverVariablesCache cache.Cache[runtimeclient.CallExtensionCacheEntry]
 }
 
 func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
@@ -84,6 +91,7 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 		Watches(
 			&runtimev1.ExtensionConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.extensionConfigToClusterClass),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
 		Complete(r)
@@ -91,6 +99,8 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 	if err != nil {
 		return errors.Wrap(err, "failed setting up with a controller manager")
 	}
+
+	r.discoverVariablesCache = cache.New[runtimeclient.CallExtensionCacheEntry]()
 	return nil
 }
 
@@ -302,8 +312,13 @@ func (r *Reconciler) reconcileVariables(ctx context.Context, s *scope) (ctrl.Res
 			req := &runtimehooksv1.DiscoverVariablesRequest{}
 			req.Settings = patch.External.Settings
 
+			// We temporarily cache the response of a DiscoveryVariables call to improve performance in case there are
+			// many ClusterClasses using the same runtime extension/settings combination.
+			// This also mitigates spikes when ClusterClass re-syncs happen or when changes to the ExtensionConfig are applied.
+			// DiscoverVariables is expected to return a "static" response and usually there are few ExtensionConfigs in a mgmt cluster.
 			resp := &runtimehooksv1.DiscoverVariablesResponse{}
-			err := r.RuntimeClient.CallExtension(ctx, runtimehooksv1.DiscoverVariables, clusterClass, *patch.External.DiscoverVariablesExtension, req, resp)
+			err := r.RuntimeClient.CallExtension(ctx, runtimehooksv1.DiscoverVariables, clusterClass, *patch.External.DiscoverVariablesExtension, req, resp,
+				runtimeclient.WithCaching{Cache: r.discoverVariablesCache, CacheKeyFunc: cacheKeyFunc})
 			if err != nil {
 				errs = append(errs, errors.Wrapf(err, "failed to call DiscoverVariables for patch %s", patch.Name))
 				continue
@@ -491,4 +506,13 @@ func matchNamespace(ctx context.Context, c client.Client, selector labels.Select
 		return false
 	}
 	return selector.Matches(labels.Set(ns.GetLabels()))
+}
+
+func cacheKeyFunc(registration *runtimeregistry.ExtensionRegistration, request runtimehooksv1.RequestObject) string {
+	// Note: registration.Name is identical to the value of the patch.External.DiscoverVariablesExtension field in the ClusterClass.
+	s := fmt.Sprintf("%s-%s", registration.Name, registration.ExtensionConfigResourceVersion)
+	for k, v := range request.GetSettings() {
+		s += fmt.Sprintf(",%s=%s", k, v)
+	}
+	return s
 }
